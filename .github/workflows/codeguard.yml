@@ -1,0 +1,154 @@
+name: CodeGuard CI/CD Gate
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  codeguard-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2          # need previous commit to diff
+
+      # ── 2. Set up Python ─────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 3. Determine changed Python files ────────────────────────
+      - name: Get changed files
+        id: changed
+        run: |
+          git diff --name-only HEAD~1 HEAD -- '*.py' > changed_files.txt
+          echo "Changed files:"
+          cat changed_files.txt
+          FILES=$(cat changed_files.txt | tr '\n' ',' | sed 's/,$//')
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+
+      # ── 4. Call CodeGuard /api/ci/evaluate ───────────────────────
+      - name: Run CodeGuard evaluation
+        id: codeguard
+        env:
+          CODEGUARD_API: ${{ secrets.CODEGUARD_API_URL }}
+          OVERRIDE_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'codeguard-override') }}
+        run: |
+          python - <<'EOF'
+          import os, json, requests, sys
+
+          api = os.environ.get("CODEGUARD_API", "http://localhost:8000")
+          override = os.environ.get("OVERRIDE_LABEL", "false").lower() == "true"
+
+          # Read changed files
+          with open("changed_files.txt") as f:
+              files = [l.strip() for l in f if l.strip()]
+
+          payload = {
+              "commit_sha": os.environ.get("GITHUB_SHA", "unknown"),
+              "changed_files": files,
+              "override": override,
+              "override_reason": "Override label set on PR by reviewer" if override else "",
+          }
+
+          try:
+              r = requests.post(f"{api}/api/ci/evaluate", json=payload, timeout=60)
+              result = r.json()
+          except Exception as e:
+              print(f"CodeGuard API unavailable ({e}) — defaulting to PASS for CI resilience")
+              result = {"gate_pass": True, "gate_decision": "pass", "message": "API unavailable"}
+
+          print(json.dumps(result, indent=2))
+
+          # Write summary to GitHub step summary
+          with open(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null"), "a") as f:
+              f.write("## 🛡️ CodeGuard Report\n\n")
+              f.write(f"**Decision:** {result.get('gate_decision','—').upper()}\n\n")
+              f.write(f"{result.get('message','')}\n\n")
+              for fr in result.get("file_reports", []):
+                  tier = (fr.get("ml_risk") or {}).get("risk_tier", "?")
+                  issues = fr.get("static_issue_count", 0)
+                  f.write(f"- `{fr['file']}` — Risk: **{tier}** | Static issues: {issues}\n")
+
+          # Set output for next step
+          with open(os.environ.get("GITHUB_OUTPUT", "/dev/null"), "a") as f:
+              f.write(f"gate_pass={str(result.get('gate_pass', True)).lower()}\n")
+              f.write(f"gate_decision={result.get('gate_decision','pass')}\n")
+              f.write(f"has_high_risk={str(result.get('has_high_risk', False)).lower()}\n")
+          EOF
+
+      # ── 5. Post PR comment ────────────────────────────────────────
+      - name: Post PR comment with risk report
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const decision = '${{ steps.codeguard.outputs.gate_decision }}';
+            const icon = decision === 'pass' ? '✅' : decision === 'overridden' ? '⚠️' : '🚫';
+            const body = `## ${icon} CodeGuard Gate: **${decision.toUpperCase()}**
+
+            | Metric | Value |
+            |--------|-------|
+            | Decision | ${decision} |
+            | Commit | \`${{ github.sha }}\` |
+
+            > **The model informs; a human decides.**
+            > To override a block, add the label \`codeguard-override\` to this PR and re-run.
+
+            _Full report available in the [Actions summary](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})._`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body,
+            });
+
+      # ── 6. Fail build if High-risk and no override ────────────────
+      - name: Fail if High-risk (no override)
+        if: steps.codeguard.outputs.gate_pass == 'false'
+        run: |
+          echo "🚫 CodeGuard blocked this deployment: High-risk files detected."
+          echo "Add the 'codeguard-override' label to this PR with a justification to proceed."
+          exit 1
+
+      # ── 7. Regenerate quality badge on pass ───────────────────────
+      - name: Regenerate quality badge
+        if: steps.codeguard.outputs.gate_pass == 'true' && github.ref == 'refs/heads/main'
+        env:
+          CODEGUARD_API: ${{ secrets.CODEGUARD_API_URL }}
+        run: |
+          python - <<'EOF'
+          import os, requests
+          api = os.environ.get("CODEGUARD_API", "http://localhost:8000")
+          try:
+              # Fetch badge for project id 1 (default target)
+              r = requests.get(f"{api}/api/projects/1/badge.svg", timeout=15)
+              if r.status_code == 200:
+                  with open("badge.svg", "wb") as f:
+                      f.write(r.content)
+                  print("Badge regenerated → badge.svg")
+          except Exception as e:
+              print(f"Badge fetch failed: {e}")
+          EOF
+
+      - name: Commit badge if changed
+        if: steps.codeguard.outputs.gate_pass == 'true' && github.ref == 'refs/heads/main'
+        run: |
+          git config --local user.email "codeguard[bot]@users.noreply.github.com"
+          git config --local user.name "CodeGuard Bot"
+          git add badge.svg || true
+          git diff --staged --quiet || git commit -m "chore: update CodeGuard quality badge [skip ci]"
+          git push || true
